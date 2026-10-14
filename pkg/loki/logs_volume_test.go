@@ -27,14 +27,20 @@ func TestLogsVolumeRequestsAndMerge(t *testing.T) {
 			require.Equal(t, "180000000000", req.URL.Query().Get("end"))
 			require.Equal(t, "60000ms", req.URL.Query().Get("step"))
 			require.Contains(t, req.URL.Query().Get("query"), "[1m]")
-			fmt.Fprint(w, `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"level":"info"},"values":[[120,"2"],[180,"3"]]}]}}`)
+			if _, err := fmt.Fprint(w, `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"level":"info"},"values":[[120,"2"],[180,"3"]]}]}}`); err != nil {
+				t.Errorf("write mock Loki response: %v", err)
+			}
 		case "/loki/api/v1/query":
 			require.Contains(t, req.URL.Query().Get("query"), "[30s]")
 			if req.URL.Query().Get("time") == "60000000000" {
-				fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"level":"info"},"value":[60,"1"]},{"metric":{"level":"error"},"value":[60,"5"]}]}}`)
+				if _, err := fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"level":"info"},"value":[60,"1"]},{"metric":{"level":"error"},"value":[60,"5"]}]}}`); err != nil {
+					t.Errorf("write mock Loki response: %v", err)
+				}
 			} else {
 				require.Equal(t, "210000000000", req.URL.Query().Get("time"))
-				fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"level":"info"},"value":[210,"4"]},{"metric":{"level":"warn"},"value":[210,"6"]}]}}`)
+				if _, err := fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"level":"info"},"value":[210,"4"]},{"metric":{"level":"warn"},"value":[210,"6"]}]}}`); err != nil {
+					t.Errorf("write mock Loki response: %v", err)
+				}
 			}
 		default:
 			t.Errorf("unexpected endpoint %s", req.URL.Path)
@@ -102,7 +108,9 @@ func TestLogsVolumePartFailure(t *testing.T) {
 			http.Error(w, "edge query failed", http.StatusTooManyRequests)
 			return
 		}
-		fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[60,"1"]}]}}`)
+		if _, err := fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[60,"1"]}]}}`); err != nil {
+			t.Errorf("write mock Loki response: %v", err)
+		}
 	}))
 	defer server.Close()
 	plog := backend.NewLoggerWith("logger", "test")
