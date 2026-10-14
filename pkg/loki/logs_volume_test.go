@@ -64,12 +64,13 @@ func TestLogsVolumeRequestsAndMerge(t *testing.T) {
 	}
 }
 
-func TestLogsVolumeScope(t *testing.T) {
+func TestLogsVolumeLeavesOtherSupportingQueriesUnchanged(t *testing.T) {
 	for _, supporting := range []SupportingQueryType{SupportingQueryNone, SupportingQueryLogsSample, SupportingQueryDataSample, SupportingQueryInfiniteScroll, "explore"} {
 		t.Run(string(supporting), func(t *testing.T) {
 			calls := 0
 			api := makeMockedAPI(200, "application/json", []byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`), func(req *http.Request) {
 				calls++
+				require.Equal(t, `sum(count_over_time({app="test"}[1m]))`, req.URL.Query().Get("query"))
 				require.Equal(t, "30000000000", req.URL.Query().Get("start"))
 				require.Equal(t, "210000000000", req.URL.Query().Get("end"))
 			})
@@ -81,7 +82,7 @@ func TestLogsVolumeScope(t *testing.T) {
 	}
 }
 
-func TestLogsVolumeInstantQuery(t *testing.T) {
+func TestLogsVolumeLeavesDirectInstantQueriesUnchanged(t *testing.T) {
 	calls := 0
 	api := makeMockedAPI(200, "application/json", []byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`), func(req *http.Request) {
 		calls++
@@ -217,6 +218,8 @@ func TestSplitLogsVolumeQuery(t *testing.T) {
 		{"right edge", 0, 1830, []QueryType{QueryTypeRange, QueryTypeInstant}, []int64{1800, 1830}, []int64{60, 30}},
 		{"within one bucket", 10, 20, []QueryType{QueryTypeInstant}, []int64{20}, []int64{10}},
 		{"crosses one boundary", 50, 70, []QueryType{QueryTypeInstant, QueryTypeInstant}, []int64{60, 70}, []int64{10, 10}},
+		{"partial then one full bucket", 30, 120, []QueryType{QueryTypeInstant, QueryTypeRange}, []int64{60, 120}, []int64{30, 60}},
+		{"partial ending on boundary", 30, 60, []QueryType{QueryTypeInstant}, []int64{60}, []int64{30}},
 		{"one full bucket", 60, 120, []QueryType{QueryTypeRange}, []int64{120}, []int64{60}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

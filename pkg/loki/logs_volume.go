@@ -92,15 +92,16 @@ func mergeLogsVolumeResults(parts []lokiQuery, results []*backend.DataResponse) 
 	}
 	// Rates must be recomputed from total work and execution time, not summed.
 	if index, ok := statIndexes[statSummaryExecTime]; ok && stats[index].Value > 0 {
-		recomputeRate := func(rate, total string) {
-			rateIndex, hasRate := statIndexes[rate]
-			totalIndex, hasTotal := statIndexes[total]
-			if hasRate && hasTotal {
-				stats[rateIndex].Value = stats[totalIndex].Value / stats[index].Value
-			}
+		bytesRate, hasBytesRate := statIndexes[statSummaryBytesProcessedPerSecond]
+		bytesTotal, hasBytesTotal := statIndexes[statSummaryTotalBytesProcessed]
+		if hasBytesRate && hasBytesTotal {
+			stats[bytesRate].Value = stats[bytesTotal].Value / stats[index].Value
 		}
-		recomputeRate(statSummaryBytesProcessedPerSecond, statSummaryTotalBytesProcessed)
-		recomputeRate(statSummaryLinesProcessedPerSecond, statSummaryTotalLinesProcessed)
+		linesRate, hasLinesRate := statIndexes[statSummaryLinesProcessedPerSecond]
+		linesTotal, hasLinesTotal := statIndexes[statSummaryTotalLinesProcessed]
+		if hasLinesRate && hasLinesTotal {
+			stats[linesRate].Value = stats[linesTotal].Value / stats[index].Value
+		}
 	}
 	if len(merged.Frames) > 0 {
 		merged.Frames[0].Meta.Stats = stats
@@ -118,26 +119,29 @@ func splitLogsVolumeQuery(query lokiQuery) ([]lokiQuery, error) {
 	if !query.End.After(query.Start) {
 		return nil, fmt.Errorf("logs volume end must be after start")
 	}
-	// The wire format expresses steps in whole milliseconds.
+	// api.go serializes the HTTP step parameter in whole milliseconds.
+	// Use the same precision when calculating bucket boundaries and lookbacks.
 	query.Step = query.Step.Truncate(time.Millisecond)
 	parts := make([]lokiQuery, 0, 3)
 	start := query.Start
-	alignedStart := time.Unix(0, start.UnixNano()/int64(query.Step)*int64(query.Step))
+	alignedStart := alignLogsVolumeTime(start, query.Step)
 	if !start.Equal(alignedStart) {
 		end := alignedStart.Add(query.Step)
 		if end.After(query.End) {
 			end = query.End
 		}
-		part, err := logsVolumePart(query, start, end, QueryTypeInstant, end.Sub(start))
+		part, err := logsVolumeInstantPart(query, end, end.Sub(start))
 		if err != nil {
 			return nil, err
 		}
 		parts = append(parts, part)
 		start = end
 	}
-	alignedEnd := time.Unix(0, query.End.UnixNano()/int64(query.Step)*int64(query.Step))
+	alignedEnd := alignLogsVolumeTime(query.End, query.Step)
 	if start.Before(alignedEnd) {
-		part, err := logsVolumePart(query, start.Add(query.Step), alignedEnd, QueryTypeRange, query.Step)
+		// Evaluations mark bucket ends: the first full lookback starts at
+		// start, so its evaluation must be one step later.
+		part, err := logsVolumeRangePart(query, start.Add(query.Step), alignedEnd)
 		if err != nil {
 			return nil, err
 		}
@@ -145,7 +149,7 @@ func splitLogsVolumeQuery(query lokiQuery) ([]lokiQuery, error) {
 		start = alignedEnd
 	}
 	if start.Before(query.End) {
-		part, err := logsVolumePart(query, start, query.End, QueryTypeInstant, query.End.Sub(start))
+		part, err := logsVolumeInstantPart(query, query.End, query.End.Sub(start))
 		if err != nil {
 			return nil, err
 		}
@@ -154,13 +158,37 @@ func splitLogsVolumeQuery(query lokiQuery) ([]lokiQuery, error) {
 	return parts, nil
 }
 
-func logsVolumePart(query lokiQuery, start, end time.Time, queryType QueryType, window time.Duration) (lokiQuery, error) {
-	if window%time.Millisecond != 0 {
-		return lokiQuery{}, fmt.Errorf("logs volume bucket duration must use millisecond precision")
-	}
-	expr, err := syntax.ParseExpr(query.Expr)
+func logsVolumeInstantPart(query lokiQuery, evaluationTime time.Time, lookback time.Duration) (lokiQuery, error) {
+	expression, err := logsVolumeExpression(query.Expr, lookback)
 	if err != nil {
-		return lokiQuery{}, fmt.Errorf("parse logs volume query: %w", err)
+		return lokiQuery{}, err
+	}
+	query.Expr = expression
+	// The instant endpoint uses End as its time parameter and has no start.
+	query.Start = time.Time{}
+	query.End = evaluationTime
+	query.QueryType = QueryTypeInstant
+	return query, nil
+}
+
+func logsVolumeRangePart(query lokiQuery, start, end time.Time) (lokiQuery, error) {
+	expression, err := logsVolumeExpression(query.Expr, query.Step)
+	if err != nil {
+		return lokiQuery{}, err
+	}
+	query.Expr = expression
+	query.Start, query.End = start, end
+	query.QueryType = QueryTypeRange
+	return query, nil
+}
+
+func logsVolumeExpression(expression string, window time.Duration) (string, error) {
+	if window%time.Millisecond != 0 {
+		return "", fmt.Errorf("logs volume bucket duration must use millisecond precision")
+	}
+	expr, err := syntax.ParseExpr(expression)
+	if err != nil {
+		return "", fmt.Errorf("parse logs volume query: %w", err)
 	}
 	found := false
 	expr.Walk(func(node syntax.Expr) bool {
@@ -174,9 +202,15 @@ func logsVolumePart(query lokiQuery, start, end time.Time, queryType QueryType, 
 		return true
 	})
 	if !found {
-		return lokiQuery{}, fmt.Errorf("logs volume query must contain count_over_time")
+		return "", fmt.Errorf("logs volume query must contain count_over_time")
 	}
-	query.Expr = expr.String()
-	query.Start, query.End, query.QueryType = start, end, queryType
-	return query, nil
+	return expr.String(), nil
+}
+
+// alignLogsVolumeTime matches Loki's queryrangebase.StepAlignMiddleware:
+// (timestamp.UnixMilli() / stepMilliseconds) * stepMilliseconds.
+// Callers validate and truncate step to at least one whole millisecond.
+func alignLogsVolumeTime(timestamp time.Time, step time.Duration) time.Time {
+	stepMilliseconds := step.Milliseconds()
+	return time.UnixMilli(timestamp.UnixMilli() / stepMilliseconds * stepMilliseconds)
 }
