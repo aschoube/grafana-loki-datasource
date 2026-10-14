@@ -298,3 +298,34 @@ func TestLogsVolumePreservesExistingOffset(t *testing.T) {
 		})
 	}
 }
+
+func TestLogsVolumeDailyChunksCoverEveryBucket(t *testing.T) {
+	for _, step := range []time.Duration{time.Minute, 7 * time.Minute} {
+		t.Run(step.String(), func(t *testing.T) {
+			start := time.Unix(30, 0)
+			end := start.Add(73 * time.Hour)
+			boundaries := []time.Time{start}
+			for day := 1; day <= 3; day++ {
+				boundaries = append(boundaries, alignLogsVolumeTime(time.Unix(0, 0).Add(time.Duration(day)*24*time.Hour), step))
+			}
+			boundaries = append(boundaries, end)
+			coveredUntil := start
+			instantCount := 0
+			for i := 1; i < len(boundaries); i++ {
+				parts, err := splitLogsVolumeQuery(lokiQuery{Expr: `sum(count_over_time({app="test"}[1m]))`, Start: boundaries[i-1], End: boundaries[i], Step: step})
+				require.NoError(t, err)
+				for _, part := range parts {
+					if part.QueryType == QueryTypeInstant {
+						instantCount++
+						require.True(t, i == 1 || i == len(boundaries)-1)
+					} else {
+						require.Equal(t, coveredUntil, part.Start.Add(-step), "no bucket skipped at daily boundary")
+					}
+					coveredUntil = part.End
+				}
+			}
+			require.Equal(t, 2, instantCount)
+			require.Equal(t, end, coveredUntil)
+		})
+	}
+}
