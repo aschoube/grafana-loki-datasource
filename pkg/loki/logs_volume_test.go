@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,20 +63,26 @@ func TestLogsVolumeMergesBucketsForEachLevel(t *testing.T) {
 	middle := &backend.DataResponse{Frames: data.Frames{
 		frame("info", []time.Time{time.Unix(120, 0), time.Unix(180, 0)}, []float64{2, 3}),
 	}}
+	// Loki evaluates the trailing partial bucket at the real end (210s) so the
+	// count matches the log lines; the merge reports it at the aligned bucket end.
 	last := &backend.DataResponse{Frames: data.Frames{
 		frame("info", []time.Time{time.Unix(210, 0)}, []float64{4}),
 		frame("warn", []time.Time{time.Unix(210, 0)}, []float64{6}),
 	}}
-	merged := mergeLogsVolumeResults([]lokiQuery{{Step: time.Minute}, {Step: time.Minute}, {Step: time.Minute}}, []*backend.DataResponse{first, middle, last})
+	query := lokiQuery{Expr: `sum by (level) (count_over_time({app="test"}[1m]))`, Start: time.Unix(30, 0), End: time.Unix(210, 0), Step: time.Minute}
+	parts, err := splitLogsVolumeQuery(query)
+	require.NoError(t, err)
+	require.Len(t, parts, 3)
+	merged := mergeLogsVolumeResults(query, parts, []*backend.DataResponse{first, middle, last})
 	require.Len(t, merged.Frames, 3)
 	for i, expected := range []struct {
 		level  string
 		times  []time.Time
 		counts []float64
 	}{
-		{"info", []time.Time{time.Unix(60, 0), time.Unix(120, 0), time.Unix(180, 0), time.Unix(210, 0)}, []float64{1, 2, 3, 4}},
+		{"info", []time.Time{time.Unix(60, 0), time.Unix(120, 0), time.Unix(180, 0), time.Unix(240, 0)}, []float64{1, 2, 3, 4}},
 		{"error", []time.Time{time.Unix(60, 0)}, []float64{5}},
-		{"warn", []time.Time{time.Unix(210, 0)}, []float64{6}},
+		{"warn", []time.Time{time.Unix(240, 0)}, []float64{6}},
 	} {
 		t.Run(expected.level, func(t *testing.T) {
 			actual := merged.Frames[i]
@@ -89,6 +96,42 @@ func TestLogsVolumeMergesBucketsForEachLevel(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLogsVolumeBucketTime(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		end      time.Time
+		expected time.Time
+	}{
+		{"aligned leading edge stays", time.Unix(60, 0), time.Unix(60, 0)},
+		{"trailing edge moves to bucket end", time.Unix(210, 0), time.Unix(240, 0)},
+		{"range inside one bucket", time.Unix(20, 0), time.Unix(60, 0)},
+		{"one millisecond into a bucket", time.UnixMilli(60_001), time.Unix(120, 0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.expected, logsVolumeBucketTime(lokiQuery{End: tc.end, Step: time.Minute}))
+		})
+	}
+}
+
+func TestLogsVolumeExecutedQueryString(t *testing.T) {
+	query := lokiQuery{Expr: `sum by (level) (count_over_time({app="test"}[1m]))`, Start: time.Unix(30, 0).In(time.FixedZone("test", 3600)), End: time.Unix(210, 0), Step: time.Minute}
+	parts, err := splitLogsVolumeQuery(query)
+	require.NoError(t, err)
+	frame := data.NewFrame("", data.NewField("Time", nil, []time.Time{time.Unix(120, 0)}), data.NewField("Value", nil, []float64{1}))
+	frame.Meta = &data.FrameMeta{}
+	merged := mergeLogsVolumeResults(query, parts, []*backend.DataResponse{{}, {Frames: data.Frames{frame}}, {}})
+	require.Len(t, merged.Frames, 1)
+	// The first two lines match other metric range frames so the frontend
+	// recovers the user's expression; the remaining lines describe the requests.
+	require.Equal(t, strings.Join([]string{
+		`Expr: sum by (level) (count_over_time({app="test"}[1m]))`,
+		`Step: 1m0s`,
+		`Instant: sum by (level)(count_over_time({app="test"}[30s] offset 1ns)) time=1970-01-01T00:01:00Z`,
+		`Range: sum by (level)(count_over_time({app="test"}[1m] offset 1ns)) start=1970-01-01T00:02:00Z end=1970-01-01T00:03:00Z`,
+		`Instant: sum by (level)(count_over_time({app="test"}[30s] offset 1ns)) time=1970-01-01T00:03:30Z`,
+	}, "\n"), merged.Frames[0].Meta.ExecutedQueryString)
 }
 
 func TestLogsVolumeLeavesOtherRangeQueriesUnchanged(t *testing.T) {
@@ -143,32 +186,59 @@ func TestLogsVolumePartFailure(t *testing.T) {
 	require.Empty(t, result.Frames)
 }
 
-func TestLogsVolumeMergeKeepsFingerprintCollisionsSeparate(t *testing.T) {
-	// Real collision in data.Labels.Fingerprint (64-bit FNV-1). Both label
-	// values are printable ASCII; no invalid UTF-8 or mocked hash is involved.
-	first := data.Labels{"level": "reference"}
-	second := data.Labels{"level": "vP&(Q2;qZ&Zx"}
-	require.False(t, first.Equals(second))
-	require.Equal(t, data.Fingerprint(0x893da6e08f14b022), first.Fingerprint())
-	require.Equal(t, data.Fingerprint(0x893da6e08f14b022), second.Fingerprint())
-
-	makeResult := func(labels data.Labels, timestamp int64, count float64) *backend.DataResponse {
-		frame := data.NewFrame("", data.NewField("Time", nil, []time.Time{time.Unix(timestamp, 0)}), data.NewField("Value", labels, []float64{count}))
-		frame.Meta = &data.FrameMeta{}
-		return &backend.DataResponse{Frames: data.Frames{frame}}
+func TestLogsVolumeFallsBackToOriginalQuery(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		expr string
+	}{
+		{"no count_over_time", `sum by (level) (bytes_over_time({app="test"}[1m]))`},
+		{"unparsable", `sum by (level) (count_over_time({app="test"}[1m])`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			api := makeMockedAPI(200, "application/json", []byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`), func(req *http.Request) {
+				calls++
+				require.Equal(t, "/loki/api/v1/query_range", req.URL.Path)
+				require.Equal(t, tc.expr, req.URL.Query().Get("query"))
+				require.Equal(t, "30000000000", req.URL.Query().Get("start"))
+				require.Equal(t, "210000000000", req.URL.Query().Get("end"))
+			})
+			query := lokiQuery{Expr: tc.expr, QueryType: QueryTypeRange, SupportingQueryType: SupportingQueryLogsVolume, Start: time.Unix(30, 0), End: time.Unix(210, 0), Step: time.Minute}
+			result, err := runQuery(context.Background(), api, &query, ResponseOpts{}, backend.NewLoggerWith("logger", "test"))
+			require.NoError(t, err)
+			require.NoError(t, result.Error)
+			require.Equal(t, 1, calls, "the unmodified query is sent to Loki exactly once")
+		})
 	}
-	merged := mergeLogsVolumeResults(
-		[]lokiQuery{{Step: time.Minute}, {Step: time.Minute}, {Step: time.Minute}},
-		[]*backend.DataResponse{makeResult(first, 60, 1), makeResult(second, 120, 2), makeResult(first.Copy(), 180, 3)},
-	)
-	require.Len(t, merged.Frames, 2, "different labels must not merge even if their fingerprints match")
-	require.Equal(t, first, merged.Frames[0].Fields[1].Labels)
-	require.Equal(t, 2, merged.Frames[0].Rows(), "identical labels still merge within a collision bucket")
-	require.Equal(t, float64(1), merged.Frames[0].Fields[1].At(0))
-	require.Equal(t, float64(3), merged.Frames[0].Fields[1].At(1))
-	require.Equal(t, second, merged.Frames[1].Fields[1].Labels)
-	require.Equal(t, 1, merged.Frames[1].Rows())
-	require.Equal(t, float64(2), merged.Frames[1].Fields[1].At(0))
+}
+
+func TestLogsVolumeZeroLengthRangeIsEmpty(t *testing.T) {
+	calls := 0
+	api := makeMockedAPI(200, "application/json", []byte(`{}`), func(*http.Request) { calls++ })
+	query := lokiQuery{Expr: `sum(count_over_time({app="test"}[1m]))`, QueryType: QueryTypeRange, SupportingQueryType: SupportingQueryLogsVolume, Start: time.Unix(30, 0), End: time.Unix(30, 0), Step: time.Minute}
+	result, err := runQuery(context.Background(), api, &query, ResponseOpts{}, backend.NewLoggerWith("logger", "test"))
+	require.NoError(t, err)
+	require.NoError(t, result.Error)
+	require.Equal(t, backend.StatusOK, result.Status)
+	require.Empty(t, result.Frames)
+	require.Zero(t, calls)
+}
+
+func TestLogsVolumeTruncatesNanosecondBounds(t *testing.T) {
+	query := lokiQuery{Expr: `sum(count_over_time({app="test"}[1m]))`, Start: time.Unix(30, 500_000), End: time.Unix(210, 999_999_999), Step: time.Minute}
+	parts, err := splitLogsVolumeQuery(query)
+	require.NoError(t, err)
+	require.Len(t, parts, 3)
+	require.Equal(t, time.Unix(60, 0), parts[0].End)
+	require.Contains(t, parts[0].Expr, "[30s]")
+	require.Equal(t, time.UnixMilli(210_999), parts[2].End)
+	require.Contains(t, parts[2].Expr, "[30s999ms]")
+
+	t.Run("sub-millisecond range covers nothing", func(t *testing.T) {
+		parts, err := splitLogsVolumeQuery(lokiQuery{Expr: `sum(count_over_time({app="test"}[1m]))`, Start: time.Unix(30, 100), End: time.Unix(30, 900), Step: time.Minute})
+		require.NoError(t, err)
+		require.Empty(t, parts)
+	})
 }
 
 func TestLogsVolumeStatistics(t *testing.T) {
@@ -183,7 +253,7 @@ func TestLogsVolumeStatistics(t *testing.T) {
 		}}
 		return &backend.DataResponse{Frames: data.Frames{frame}}
 	}
-	merged := mergeLogsVolumeResults([]lokiQuery{{Step: time.Minute}, {Step: time.Minute}}, []*backend.DataResponse{makeResult(60, 1, 100, 1000, 1), makeResult(120, 2, 500, 5000, 2)})
+	merged := mergeLogsVolumeResults(lokiQuery{Step: time.Minute}, []lokiQuery{{QueryType: QueryTypeRange, Step: time.Minute}, {QueryType: QueryTypeRange, Step: time.Minute}}, []*backend.DataResponse{makeResult(60, 1, 100, 1000, 1), makeResult(120, 2, 500, 5000, 2)})
 	require.Len(t, merged.Frames, 1)
 	require.Equal(t, 2, merged.Frames[0].Rows())
 	stats := merged.Frames[0].Meta.Stats
