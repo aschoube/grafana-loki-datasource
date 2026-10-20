@@ -6,7 +6,6 @@ import {
   type DataQueryResponse,
   LoadingState,
   type QueryResultMetaStat,
-  generateUUID,
 } from '@grafana/data';
 import { config } from '@grafana/runtime';
 
@@ -83,7 +82,7 @@ function splitQueriesByStreamShard(
   splittingTargets: LokiQuery[]
 ) {
   let shouldStop = false;
-  let mergedResponse: DataQueryResponse = { data: [], state: LoadingState.Streaming, key: generateUUID() };
+  let mergedResponse: DataQueryResponse = { data: [], state: LoadingState.Streaming, key: crypto.randomUUID() };
   let subquerySubscription: Subscription | null = null;
   let retriesMap = new Map<string, number>();
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
