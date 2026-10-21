@@ -62,7 +62,7 @@ func runLogsVolumeQuery(ctx context.Context, api *LokiAPI, query *lokiQuery, opt
 
 func mergeLogsVolumeResults(query lokiQuery, parts []lokiQuery, results []*backend.DataResponse) *backend.DataResponse {
 	merged := &backend.DataResponse{Status: backend.StatusOK}
-	series := make(map[string]*data.Frame)
+	series := make(map[data.Fingerprint]*data.Frame)
 	var stats []data.QueryStat
 	statIndexes := make(map[string]int)
 	for i, result := range results {
@@ -79,8 +79,9 @@ func mergeLogsVolumeResults(query lokiQuery, parts []lokiQuery, results []*backe
 			if parts[i].QueryType == QueryTypeInstant {
 				setFieldTimes(frame.Fields[0], logsVolumeBucketTime(parts[i]))
 			}
-			// Adjusted metric frames keep their labels on the value field.
-			key := frame.Fields[1].Labels.String()
+			// Adjusted metric frames keep their labels on the value field. Labels.String()
+			// does not escape values, so distinct label sets can render identically.
+			key := frame.Fields[1].Labels.Fingerprint()
 			if existing, ok := series[key]; ok {
 				for row := 0; row < frame.Rows(); row++ {
 					existing.AppendRow(frame.Fields[0].At(row), frame.Fields[1].At(row))

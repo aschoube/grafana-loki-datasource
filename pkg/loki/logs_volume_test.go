@@ -107,6 +107,33 @@ func TestLogsVolumeMergesBucketsForEachLevel(t *testing.T) {
 	}
 }
 
+// data.Labels.String() writes k=v pairs without quoting, so distinct label sets
+// can render identically. The merge must key series by identity, not by that
+// rendering, or two series collapse into one frame with mixed timestamps.
+func TestLogsVolumeMergeKeepsSeriesWithCollidingLabelStrings(t *testing.T) {
+	first := data.Labels{"a": "x, b=y"}
+	second := data.Labels{"a": "x", "b": "y"}
+	require.Equal(t, first.String(), second.String(), "test premise: the two label sets must render identically")
+
+	frame := func(labels data.Labels, count float64) *data.Frame {
+		f := data.NewFrame("", data.NewField("Time", nil, []time.Time{time.Unix(60, 0)}), data.NewField("Value", labels, []float64{count}))
+		f.Meta = &data.FrameMeta{}
+		return f
+	}
+	parts := []lokiQuery{{QueryType: QueryTypeRange, Step: time.Minute}}
+	results := []*backend.DataResponse{{Frames: data.Frames{frame(first, 1), frame(second, 2)}}}
+
+	merged := mergeLogsVolumeResults(lokiQuery{Step: time.Minute}, parts, results)
+
+	require.Len(t, merged.Frames, 2, "distinct label sets must stay separate series")
+	require.True(t, merged.Frames[0].Fields[1].Labels.Equals(first))
+	require.Equal(t, 1, merged.Frames[0].Rows())
+	require.Equal(t, float64(1), merged.Frames[0].Fields[1].At(0))
+	require.True(t, merged.Frames[1].Fields[1].Labels.Equals(second))
+	require.Equal(t, 1, merged.Frames[1].Rows())
+	require.Equal(t, float64(2), merged.Frames[1].Fields[1].At(0))
+}
+
 func TestLogsVolumeBucketTime(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
