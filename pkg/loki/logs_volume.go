@@ -79,8 +79,7 @@ func mergeLogsVolumeResults(query lokiQuery, parts []lokiQuery, results []*backe
 			if parts[i].QueryType == QueryTypeInstant {
 				setFieldTimes(frame.Fields[0], logsVolumeBucketTime(parts[i]))
 			}
-			// Adjusted metric frames keep their labels on the value field. Labels.String()
-			// does not escape values, so distinct label sets can render identically.
+			// Adjusted metric frames keep their labels on the value field. 
 			key := frame.Fields[1].Labels.Fingerprint()
 			if existing, ok := series[key]; ok {
 				for row := 0; row < frame.Rows(); row++ {

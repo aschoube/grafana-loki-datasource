@@ -107,9 +107,6 @@ func TestLogsVolumeMergesBucketsForEachLevel(t *testing.T) {
 	}
 }
 
-// data.Labels.String() writes k=v pairs without quoting, so distinct label sets
-// can render identically. The merge must key series by identity, not by that
-// rendering, or two series collapse into one frame with mixed timestamps.
 func TestLogsVolumeMergeKeepsSeriesWithCollidingLabelStrings(t *testing.T) {
 	first := data.Labels{"a": "x, b=y"}
 	second := data.Labels{"a": "x", "b": "y"}
