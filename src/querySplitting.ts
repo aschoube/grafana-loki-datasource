@@ -423,6 +423,8 @@ export function runSplitQuery(
   const stepMsPartition = groupBy(metricQueries, (query) =>
     calculateStep(request.intervalMs, request.range, query.resolution || 1, query.step)
   );
+  const alignLogsVolumeBoundaries = (config.featureToggles as Record<string, boolean | undefined>)
+    .lokiLogsVolumeBoundaryCoverage;
 
   for (const stepMs in stepMsPartition) {
     const targets = stepMsPartition[stepMs].map((q) => {
@@ -431,7 +433,7 @@ export function runSplitQuery(
     });
     const [volumeTargets, otherTargets] = partition(
       targets,
-      (query) => query.supportingQueryType === SupportingQueryType.LogsVolume
+      (query) => alignLogsVolumeBoundaries && query.supportingQueryType === SupportingQueryType.LogsVolume
     );
     if (volumeTargets.length) {
       requests.push({

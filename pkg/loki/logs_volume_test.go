@@ -12,10 +12,19 @@ import (
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/tracing"
+	"github.com/grafana/grafana-plugin-sdk-go/config"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
+	"github.com/grafana/grafana-plugin-sdk-go/experimental/featuretoggles"
 	"github.com/grafana/loki/v3/pkg/logql/syntax"
 	"github.com/stretchr/testify/require"
 )
+
+// boundaryCoverageContext enables the feature toggle that routes logs volume
+// range queries through runLogsVolumeQuery.
+func boundaryCoverageContext() context.Context {
+	cfg := config.NewGrafanaCfg(map[string]string{featuretoggles.EnabledFeatures: flagLokiLogsVolumeBoundaryCoverage})
+	return config.WithGrafanaConfig(context.Background(), cfg)
+}
 
 func TestLogsVolumeQueryPartRequests(t *testing.T) {
 	query := lokiQuery{Expr: `sum by (level) (count_over_time({app="test"}[1m]))`, QueryType: QueryTypeRange, SupportingQueryType: SupportingQueryLogsVolume, Start: time.Unix(30, 0), End: time.Unix(210, 0), Step: time.Minute}
@@ -145,7 +154,7 @@ func TestLogsVolumeLeavesOtherRangeQueriesUnchanged(t *testing.T) {
 				require.Equal(t, "210000000000", req.URL.Query().Get("end"))
 			})
 			query := lokiQuery{Expr: `sum(count_over_time({app="test"}[1m]))`, QueryType: QueryTypeRange, SupportingQueryType: supporting, Start: time.Unix(30, 0), End: time.Unix(210, 0), Step: time.Minute}
-			_, err := runQuery(context.Background(), api, &query, ResponseOpts{}, backend.NewLoggerWith("logger", "test"))
+			_, err := runQuery(boundaryCoverageContext(), api, &query, ResponseOpts{}, backend.NewLoggerWith("logger", "test"))
 			require.NoError(t, err)
 			require.Equal(t, 1, calls)
 		})
@@ -161,7 +170,7 @@ func TestLogsVolumeLeavesDirectInstantQueriesUnchanged(t *testing.T) {
 		require.Equal(t, `sum(count_over_time({app="test"}[3m]))`, req.URL.Query().Get("query"))
 	})
 	query := lokiQuery{Expr: `sum(count_over_time({app="test"}[3m]))`, QueryType: QueryTypeInstant, SupportingQueryType: SupportingQueryLogsVolume, Start: time.Unix(30, 0), End: time.Unix(210, 0), Step: time.Minute}
-	_, err := runQuery(context.Background(), api, &query, ResponseOpts{}, backend.NewLoggerWith("logger", "test"))
+	_, err := runQuery(boundaryCoverageContext(), api, &query, ResponseOpts{}, backend.NewLoggerWith("logger", "test"))
 	require.NoError(t, err)
 	require.Equal(t, 1, calls)
 }
@@ -179,7 +188,7 @@ func TestLogsVolumePartFailure(t *testing.T) {
 	plog := backend.NewLoggerWith("logger", "test")
 	api := newLokiAPI(server.Client(), server.URL, plog, tracing.DefaultTracer())
 	query := lokiQuery{Expr: `sum(count_over_time({app="test"}[1m]))`, QueryType: QueryTypeRange, SupportingQueryType: SupportingQueryLogsVolume, Start: time.Unix(30, 0), End: time.Unix(210, 0), Step: time.Minute}
-	result, err := runQuery(context.Background(), api, &query, ResponseOpts{}, plog)
+	result, err := runQuery(boundaryCoverageContext(), api, &query, ResponseOpts{}, plog)
 	require.NoError(t, err)
 	require.ErrorContains(t, result.Error, "edge query failed")
 	require.Equal(t, backend.Status(http.StatusTooManyRequests), result.Status)
@@ -204,7 +213,7 @@ func TestLogsVolumeFallsBackToOriginalQuery(t *testing.T) {
 				require.Equal(t, "210000000000", req.URL.Query().Get("end"))
 			})
 			query := lokiQuery{Expr: tc.expr, QueryType: QueryTypeRange, SupportingQueryType: SupportingQueryLogsVolume, Start: time.Unix(30, 0), End: time.Unix(210, 0), Step: time.Minute}
-			result, err := runQuery(context.Background(), api, &query, ResponseOpts{}, backend.NewLoggerWith("logger", "test"))
+			result, err := runQuery(boundaryCoverageContext(), api, &query, ResponseOpts{}, backend.NewLoggerWith("logger", "test"))
 			require.NoError(t, err)
 			require.NoError(t, result.Error)
 			require.Equal(t, 1, calls, "the unmodified query is sent to Loki exactly once")
@@ -216,12 +225,28 @@ func TestLogsVolumeZeroLengthRangeIsEmpty(t *testing.T) {
 	calls := 0
 	api := makeMockedAPI(200, "application/json", []byte(`{}`), func(*http.Request) { calls++ })
 	query := lokiQuery{Expr: `sum(count_over_time({app="test"}[1m]))`, QueryType: QueryTypeRange, SupportingQueryType: SupportingQueryLogsVolume, Start: time.Unix(30, 0), End: time.Unix(30, 0), Step: time.Minute}
-	result, err := runQuery(context.Background(), api, &query, ResponseOpts{}, backend.NewLoggerWith("logger", "test"))
+	result, err := runQuery(boundaryCoverageContext(), api, &query, ResponseOpts{}, backend.NewLoggerWith("logger", "test"))
 	require.NoError(t, err)
 	require.NoError(t, result.Error)
 	require.Equal(t, backend.StatusOK, result.Status)
 	require.Empty(t, result.Frames)
 	require.Zero(t, calls)
+}
+
+func TestLogsVolumeKeepsOriginalQueryWithoutFeatureToggle(t *testing.T) {
+	calls := 0
+	api := makeMockedAPI(200, "application/json", []byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`), func(req *http.Request) {
+		calls++
+		require.Equal(t, "/loki/api/v1/query_range", req.URL.Path)
+		require.Equal(t, `sum by (level) (count_over_time({app="test"}[1m]))`, req.URL.Query().Get("query"))
+		require.Equal(t, "30000000000", req.URL.Query().Get("start"))
+		require.Equal(t, "210000000000", req.URL.Query().Get("end"))
+	})
+	query := lokiQuery{Expr: `sum by (level) (count_over_time({app="test"}[1m]))`, QueryType: QueryTypeRange, SupportingQueryType: SupportingQueryLogsVolume, Start: time.Unix(30, 0), End: time.Unix(210, 0), Step: time.Minute}
+	result, err := runQuery(context.Background(), api, &query, ResponseOpts{}, backend.NewLoggerWith("logger", "test"))
+	require.NoError(t, err)
+	require.NoError(t, result.Error)
+	require.Equal(t, 1, calls, "without the toggle the range query is sent to Loki unchanged, with no edge requests")
 }
 
 func TestLogsVolumeTruncatesNanosecondBounds(t *testing.T) {
