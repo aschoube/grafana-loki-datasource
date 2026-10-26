@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fix: Restore POST queries through the Grafana data source proxy for instant queries, range queries, labels, label values, and series, with or without `/loki` in the data source URL. These routes require `datasources:query` permission; non-allowlisted writes remain blocked.
+
 ## 13.2.3
 
 - Chore: Pin golangci-lint to 2.15.0 in development dependencies and CI/CD pipelines
