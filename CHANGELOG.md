@@ -4,8 +4,15 @@
 
 - Fix: Restore POST queries through the Grafana data source proxy for instant queries, range queries, labels, label values, and series, with or without `/loki` in the data source URL. These routes require `datasources:query` permission; non-allowlisted writes remain blocked.
 
+## 13.2.4
+
+- Logline: read and expose stats when available ([#210](https://github.com/grafana/grafana-loki-datasource/pull/210))
+- Chore: Update node.js to v24.22.1 ([#194](https://github.com/grafana/grafana-loki-datasource/pull/194))
+- Chore: Dependency bump ([#216](https://github.com/grafana/grafana-loki-datasource/pull/216))
+
 ## 13.2.3
 
+- Chore: Update Go to 1.27.3 ([#211](https://github.com/grafana/grafana-loki-datasource/pull/211))
 - Chore: Pin golangci-lint to 2.15.0 in development dependencies and CI/CD pipelines
 
 ## 13.2.2
